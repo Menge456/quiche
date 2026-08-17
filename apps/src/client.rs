@@ -1,46 +1,27 @@
-// Copyright (C) 2020, Cloudflare, Inc.
-// All rights reserved.
-//
-// Redistribution and use in source and binary forms, with or without
-// modification, are permitted provided that the following conditions are
-// met:
-//
-//     * Redistributions of source code must retain the above copyright notice,
-//       this list of conditions and the following disclaimer.
-//
-//     * Redistributions in binary form must reproduce the above copyright
-//       notice, this list of conditions and the following disclaimer in the
-//       documentation and/or other materials provided with the distribution.
-//
-// THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS
-// IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO,
-// THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR
-// PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR
-// CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL,
-// EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO,
-// PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR
-// PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF
-// LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING
-// NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
-// SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
-
 use crate::args::*;
 use crate::common::*;
 
 use std::io::prelude::*;
-
 use std::rc::Rc;
-
 use std::cell::RefCell;
 
 use ring::rand::*;
+use quiche::BbrParams;
 
 const MAX_DATAGRAM_SIZE: usize = 1350;
+
+// Bulk write size for the stream-saturation loop below. iperf3 defaults to
+// a 128 KiB write size for TCP tests; we mirror that here. This is purely
+// an application-layer write chunk size -- quiche/the congestion control
+// algorithm still decides how much of it actually goes out per datagram.
+const SEND_BUF_SIZE: usize = 128 * 1024;
+
+// How often to print an iperf-style interval throughput report.
+const REPORT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
 
 #[derive(Debug)]
 pub enum ClientError {
     HandshakeFail,
-    HttpFail,
     Other(String),
 }
 
@@ -51,7 +32,7 @@ pub fn connect(
     let mut buf = [0; 65535];
     let mut out = [0; MAX_DATAGRAM_SIZE];
 
-    let output_sink =
+    let _output_sink =
         Rc::new(RefCell::new(output_sink)) as Rc<RefCell<dyn FnMut(_)>>;
 
     // Setup the event loop.
@@ -68,16 +49,13 @@ pub fn connect(
         *connect_url.socket_addrs(|| None).unwrap().first().unwrap()
     };
 
-    // Bind to INADDR_ANY or IN6ADDR_ANY depending on the IP family of the
-    // server address. This is needed on macOS and BSD variants that don't
-    // support binding to IN6ADDR_ANY for both v4 and v6.
+    // Bind to INADDR_ANY or IN6ADDR_ANY depending on the IP family of the server address.
     let bind_addr = match peer_addr {
         std::net::SocketAddr::V4(_) => format!("0.0.0.0:{}", args.source_port),
         std::net::SocketAddr::V6(_) => format!("[::]:{}", args.source_port),
     };
 
-    // Create the UDP socket backing the QUIC connection, and register it with
-    // the event loop.
+    // Create the UDP socket backing the QUIC connection, and register it with the event loop.
     let mut socket =
         mio::net::UdpSocket::bind(bind_addr.parse().unwrap()).unwrap();
     poll.registry()
@@ -109,8 +87,10 @@ pub fn connect(
         config.verify_peer(!args.no_verify);
     }
 
-    config.set_application_protos(&conn_args.alpns).unwrap();
-
+    // Must match the server's ALPN override -- see the comment next to
+    // the corresponding set_application_protos() call in server.rs for
+    // why conn_args.alpns (h3/hq-interop) isn't used here.
+    config.set_application_protos(&[b"raw-bulk-transfer"]).unwrap();
     config.set_initial_rtt(conn_args.initial_rtt);
     config.set_max_idle_timeout(conn_args.idle_timeout);
     config.set_max_recv_udp_payload_size(MAX_DATAGRAM_SIZE);
@@ -129,7 +109,36 @@ pub fn connect(
 
     config.set_max_connection_window(conn_args.max_window);
     config.set_max_stream_window(conn_args.max_stream_window);
-
+    let cust_bbr = BbrParams {
+        startup_cwnd_gain: conn_args.univ_cwnd_gain,
+        drain_cwnd_gain: conn_args.univ_cwnd_gain,
+        probe_bw_cwnd_gain: conn_args.univ_cwnd_gain,
+        probe_bw_up_cwnd_gain: conn_args.univ_cwnd_gain,
+        probe_rtt_cwnd_gain: conn_args.univ_cwnd_gain,
+        startup_pacing_gain: None,
+        full_bw_threshold: None,
+        startup_full_bw_rounds: None,
+        startup_full_loss_count: None,
+        drain_pacing_gain: None,
+        enable_reno_coexistence: None,
+        enable_overestimate_avoidance: None,
+        choose_a0_point_fix: None,
+        probe_bw_probe_up_pacing_gain: None,
+        probe_bw_probe_down_pacing_gain: None,
+        probe_rtt_pacing_gain: None,
+        max_probe_up_queue_rounds: None,
+        loss_threshold: None,
+        use_bytes_delivered_for_inflight_hi: None,
+        decrease_startup_pacing_at_end_of_round: None,
+        bw_lo_reduction_strategy: None,
+        ignore_app_limited_for_no_bandwidth_growth: None,
+        initial_pacing_rate_bytes_per_second: None,
+        scale_pacing_rate_by_mss: None,
+        disable_probe_down_early_exit: None,
+        time_sent_set_to_now: None,
+        rtt_jump_detector: None,
+    };
+    config.set_custom_bbr_params(cust_bbr);
     let mut keylog = None;
 
     if let Some(keylog_path) = std::env::var_os("SSLKEYLOGFILE") {
@@ -164,10 +173,6 @@ pub fn connect(
         config.enable_dgram(true, 1000, 1000);
     }
 
-    let mut http_conn: Option<Box<dyn HttpConn>> = None;
-
-    let mut app_proto_selected = false;
-
     // Generate a random source connection ID for the connection.
     let rng = SystemRandom::new();
 
@@ -177,7 +182,6 @@ pub fn connect(
 
         conn_id.to_vec()
     } else {
-        // When fuzzing use an all zero connection ID.
         [0; quiche::MAX_CONN_ID_LEN].to_vec()
     };
 
@@ -201,7 +205,6 @@ pub fn connect(
         }
     }
 
-    // Only bother with qlog if the user specified it.
     #[cfg(feature = "qlog")]
     {
         if let Some(dir) = std::env::var_os("QLOGDIR") {
@@ -254,28 +257,31 @@ pub fn connect(
     let mut new_path_probed = false;
     let mut migrated = false;
 
-    loop {
-        if !conn.is_in_early_data() || app_proto_selected {
-            poll.poll(&mut events, conn.timeout()).unwrap();
-        }
+    // Stream ID 2 is the first client-initiated unidirectional stream in QUIC
+    let stream_id = 2;
 
-        // If the event loop reported no events, it means that the timeout
-        // has expired, so handle it without attempting to read packets. We
-        // will then proceed with the send loop.
+    // Reusable bulk payload. Content doesn't matter for a throughput test,
+    // so it's just zero-filled once up front.
+    let send_buf = vec![0u8; SEND_BUF_SIZE];
+
+    let mut total_bytes_sent: u64 = 0;
+    let mut interval_bytes_sent: u64 = 0;
+    let mut last_report = std::time::Instant::now();
+    let dur_track = std::time::Instant::now();
+    loop {
+        poll.poll(&mut events, conn.timeout()).unwrap();
+
+        // Handle timeouts.
         if events.is_empty() {
             trace!("timed out");
-
             conn.on_timeout();
         }
 
-        // Read incoming UDP packets from the socket and feed them to quiche,
-        // until there are no more packets to read.
+        // Process incoming UDP packets (ACKs, stream control from server).
         for event in &events {
             let socket = match event.token() {
                 mio::Token(0) => &socket,
-
                 mio::Token(1) => migrate_socket.as_ref().unwrap(),
-
                 _ => unreachable!(),
             };
 
@@ -283,15 +289,11 @@ pub fn connect(
             'read: loop {
                 let (len, from) = match socket.recv_from(&mut buf) {
                     Ok(v) => v,
-
                     Err(e) => {
-                        // There are no more UDP packets to read on this socket.
-                        // Process subsequent events.
                         if e.kind() == std::io::ErrorKind::WouldBlock {
                             trace!("{local_addr}: recv() would block");
                             break 'read;
                         }
-
                         return Err(ClientError::Other(format!(
                             "{local_addr}: recv() failed: {e:?}"
                         )));
@@ -302,7 +304,6 @@ pub fn connect(
 
                 if let Some(target_path) = conn_args.dump_packet_path.as_ref() {
                     let path = format!("{target_path}/{pkt_count}.pkt");
-
                     if let Ok(f) = std::fs::File::create(path) {
                         let mut f = std::io::BufWriter::new(f);
                         f.write_all(&buf[..len]).ok();
@@ -316,10 +317,8 @@ pub fn connect(
                     from,
                 };
 
-                // Process potentially coalesced packets.
                 let read = match conn.recv(&mut buf[..len], recv_info) {
                     Ok(v) => v,
-
                     Err(e) => {
                         error!("{local_addr}: recv failed: {e:?}");
                         continue 'read;
@@ -327,6 +326,27 @@ pub fn connect(
                 };
 
                 trace!("{local_addr}: processed {read} bytes");
+
+                // Drain any data the server sent back. quiche buffers
+                // received stream bytes internally, so if nothing ever
+                // calls stream_recv(), flow control will eventually stall
+                // the stream once the receive buffer fills up.
+                for stream_id in conn.readable() {
+                    let mut stream_buf = [0; 65535];
+
+                    while let Ok((read, fin)) =
+                        conn.stream_recv(stream_id, &mut stream_buf)
+                    {
+                        trace!(
+                            "received {} bytes on stream {} (fin={})",
+                            read, stream_id, fin
+                        );
+
+                        if fin {
+                            break;
+                        }
+                    }
+                }
             }
         }
 
@@ -339,12 +359,20 @@ pub fn connect(
                 conn.path_stats().collect::<Vec<quiche::PathStats>>()
             );
 
+            info!(
+                "sent {:.2} MBytes in {:.2} sec ({:.2} Mbits/sec)",
+                total_bytes_sent as f64 / 1_048_576.0,
+                app_data_start.elapsed().as_secs_f64(),
+                (total_bytes_sent as f64 * 8.0) /
+                    app_data_start.elapsed().as_secs_f64() /
+                    1_000_000.0
+            );
+
             if !conn.is_established() {
                 error!(
                     "connection timed out after {:?}",
                     app_data_start.elapsed(),
                 );
-
                 return Err(ClientError::HandshakeFail);
             }
 
@@ -354,75 +382,84 @@ pub fn connect(
                 }
             }
 
-            if let Some(h_conn) = http_conn {
-                if h_conn.report_incomplete(&app_data_start) {
-                    return Err(ClientError::HttpFail);
-                }
-            }
-
             break;
         }
 
-        // Create a new application protocol session once the QUIC connection is
-        // established.
-        if (conn.is_established() || conn.is_in_early_data()) &&
-            (!args.perform_migration || migrated) &&
-            !app_proto_selected
-        {
-            // At this stage the ALPN negotiation succeeded and selected a
-            // single application protocol name. We'll use this to construct
-            // the correct type of HttpConn but `application_proto()`
-            // returns a slice, so we have to convert it to a str in order
-            // to compare to our lists of protocols. We `unwrap()` because
-            // we need the value and if something fails at this stage, there
-            // is not much anyone can do to recover.
+        // Saturate the stream with data, iperf-style: rather than sending
+        // one small message and stopping, keep calling stream_send() with
+        // a large buffer so quiche's own congestion control (whichever
+        // algorithm was chosen via --cc-algorithm / the custom BBR params
+        // above, unchanged here) is what paces bytes onto the wire -- the
+        // same way iperf just keeps write()-ing into a TCP socket and lets
+        // the OS's TCP stack decide the actual send rate.
+        //
+        // Importantly, this is capped to roughly one send_quantum() worth
+        // of data per pass through the outer loop, rather than looping
+        // until Error::Done unconditionally. quiche will happily accept
+        // many megabytes into a stream's send buffer if the peer has
+        // granted a large flow-control window, and buffering all of it in
+        // one go starves the rest of the loop -- reading incoming ACKs,
+        // flushing packets onto the socket, printing reports -- which is
+        // what made the client look like it "stopped" after one
+        // iteration. Buffering more than a burst's worth doesn't help
+        // throughput anyway, since quiche can only put send_quantum()
+        // bytes on the wire per round regardless.
+        if conn.is_established() || conn.is_in_early_data() {
+            let send_budget = conn.send_quantum().max(send_buf.len());
+            let mut sent_this_round = 0;
 
-            let app_proto = conn.application_proto();
+            while sent_this_round < send_budget {
+                let chunk_len =
+                    send_buf.len().min(send_budget - sent_this_round);
 
-            if alpns::HTTP_09.contains(&app_proto) {
-                http_conn = Some(Http09Conn::with_urls(
-                    &args.urls,
-                    args.reqs_cardinal,
-                    Rc::clone(&output_sink),
-                ));
+                match conn.stream_send(stream_id, &send_buf[..chunk_len], false)
+                {
+                    Ok(written) => {
+                        total_bytes_sent += written as u64;
+                        interval_bytes_sent += written as u64;
+                        sent_this_round += written;
 
-                app_proto_selected = true;
-            } else if alpns::HTTP_3.contains(&app_proto) {
-                let dgram_sender = if conn_args.dgrams_enabled {
-                    Some(Http3DgramSender::new(
-                        conn_args.dgram_count,
-                        conn_args.dgram_data.clone(),
-                        0,
-                    ))
-                } else {
-                    None
-                };
+                        // A short write means the send/flow-control window
+                        // is momentarily exhausted; stop for now and let
+                        // the outer loop flush what's already queued.
+                        if written < chunk_len {
+                            break;
+                        }
+                    },
 
-                http_conn = Some(Http3Conn::with_urls(
-                    &mut conn,
-                    &args.urls,
-                    args.reqs_cardinal,
-                    &args.req_headers,
-                    &args.body,
-                    &args.method,
-                    args.send_priority_update,
-                    conn_args.max_field_section_size,
-                    conn_args.qpack_max_table_capacity,
-                    conn_args.qpack_blocked_streams,
-                    args.dump_json,
-                    dgram_sender,
-                    Rc::clone(&output_sink),
-                ));
+                    Err(quiche::Error::Done) => {
+                        // No capacity available right now (stream/
+                        // connection flow control, or congestion window
+                        // is full). Back off until the next iteration.
+                        break;
+                    },
 
-                app_proto_selected = true;
+                    Err(e) => {
+                        error!("Stream send failed: {:?}", e);
+                        break;
+                    },
+                }
             }
         }
 
-        // If we have an HTTP connection, first issue the requests then
-        // process received data.
-        if let Some(h_conn) = http_conn.as_mut() {
-            h_conn.send_requests(&mut conn, &args.dump_response_path);
-            h_conn.handle_responses(&mut conn, &mut buf, &app_data_start);
+        // Print an iperf-style interval throughput report roughly once a
+        // second: "[start-end sec]  N MBytes  N Mbits/sec".
+        let now = std::time::Instant::now();
+        if now.duration_since(last_report) >= REPORT_INTERVAL {
+            let elapsed = now.duration_since(last_report).as_secs_f64();
+            let mbits_per_sec =
+                (interval_bytes_sent as f64 * 8.0) / elapsed / 1_000_000.0;
+
+            info!(
+                "[{:>6.2}-{:>6.2} sec]  {:>8.2} MBytes  {:>8.2} Mbits/sec",
+                now.duration_since(app_data_start).as_secs_f64() - elapsed,
+                now.duration_since(app_data_start).as_secs_f64(),
+                interval_bytes_sent as f64 / 1_048_576.0,
+                mbits_per_sec
+            );
+
+            interval_bytes_sent = 0;
+            last_report = now;
         }
 
         // Handle path events.
@@ -460,12 +497,10 @@ pub fn connect(
             }
         }
 
-        // See whether source Connection IDs have been retired.
         while let Some(retired_scid) = conn.retired_scid_next() {
             info!("Retiring source CID {retired_scid:?}");
         }
 
-        // Provides as many CIDs as possible.
         while conn.scids_left() > 0 {
             let (scid, reset_token) = generate_cid_and_reset_token(&rng);
 
@@ -488,8 +523,7 @@ pub fn connect(
             new_path_probed = true;
         }
 
-        // Generate outgoing QUIC packets and send them on the UDP socket, until
-        // quiche reports that there are no more packets to be sent.
+        // Flush enqueued QUIC packets to network sockets
         let mut sockets = vec![&socket];
         if let Some(migrate_socket) = migrate_socket.as_ref() {
             sockets.push(migrate_socket);
@@ -546,6 +580,14 @@ pub fn connect(
             }
         }
 
+        let _ = match conn_args.run_timeout{
+            Some(dur) => {
+                if dur_track.elapsed() >= dur{
+                    conn.close(true, 0x1, b"timeout reached").ok();
+                }; ()},
+            None =>(),
+        };
+
         if conn.is_closed() {
             info!(
                 "connection closed, {:?} {:?}",
@@ -553,24 +595,26 @@ pub fn connect(
                 conn.path_stats().collect::<Vec<quiche::PathStats>>()
             );
 
+            info!(
+                "sent {:.2} MBytes in {:.2} sec ({:.2} Mbits/sec)",
+                total_bytes_sent as f64 / 1_048_576.0,
+                app_data_start.elapsed().as_secs_f64(),
+                (total_bytes_sent as f64 * 8.0) /
+                    app_data_start.elapsed().as_secs_f64() /
+                    1_000_000.0
+            );
+
             if !conn.is_established() {
                 error!(
                     "connection timed out after {:?}",
                     app_data_start.elapsed(),
                 );
-
                 return Err(ClientError::HandshakeFail);
             }
 
             if let Some(session_file) = &args.session_file {
                 if let Some(session) = conn.session() {
                     std::fs::write(session_file, session).ok();
-                }
-            }
-
-            if let Some(h_conn) = http_conn {
-                if h_conn.report_incomplete(&app_data_start) {
-                    return Err(ClientError::HttpFail);
                 }
             }
 

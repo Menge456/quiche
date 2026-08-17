@@ -48,6 +48,8 @@ use quiche_apps::args::*;
 use quiche_apps::common::*;
 
 use quiche_apps::sendto::*;
+use quiche::BbrParams;
+
 
 const MAX_BUF_SIZE: usize = 65507;
 
@@ -106,7 +108,20 @@ fn main() {
     config.load_cert_chain_from_pem_file(&args.cert).unwrap();
     config.load_priv_key_from_pem_file(&args.key).unwrap();
 
-    config.set_application_protos(&conn_args.alpns).unwrap();
+    // Use a dedicated ALPN instead of conn_args.alpns (h3/hq-interop).
+    // Negotiating h3 makes the branch below construct an Http3Conn, which
+    // treats stream 2 (and 3, 6, 7, 10, 11, ...) as reserved HTTP/3
+    // control and QPACK streams -- the first bytes on them must be a
+    // stream-type varint followed by a valid SETTINGS frame. Our raw
+    // bulk-transfer code writes plain payload bytes directly on streams 2
+    // and 3 via stream_send/stream_recv, which the HTTP/3 layer sees as a
+    // corrupt control stream: a fatal, connection-level protocol error.
+    // That's what was producing the CONNECTION_CLOSE -> draining ->
+    // "draining timeout expired" shutdown right after the first
+    // exchange. Advertising a custom ALPN means app_proto never matches
+    // alpns::HTTP_09 / alpns::HTTP_3 below, so client.http_conn stays
+    // None and streams 2/3 are left as plain, protocol-free QUIC streams.
+    config.set_application_protos(&[b"raw-bulk-transfer"]).unwrap();
 
     config.discover_pmtu(args.enable_pmtud);
     config.set_initial_rtt(conn_args.initial_rtt);
@@ -156,6 +171,37 @@ fn main() {
         .set_cc_algorithm_name(&conn_args.cc_algorithm)
         .unwrap();
 
+    let cust_bbr = BbrParams{
+        startup_cwnd_gain : conn_args.univ_cwnd_gain,
+        drain_cwnd_gain : conn_args.univ_cwnd_gain,
+        probe_bw_cwnd_gain : conn_args.univ_cwnd_gain,
+        probe_bw_up_cwnd_gain : conn_args.univ_cwnd_gain,
+        probe_rtt_cwnd_gain : conn_args.univ_cwnd_gain,
+        startup_pacing_gain: None,
+        full_bw_threshold: None,
+        startup_full_bw_rounds: None,
+        startup_full_loss_count: None,
+        drain_pacing_gain: None,
+        enable_reno_coexistence: None,
+        enable_overestimate_avoidance: None,
+        choose_a0_point_fix: None,
+        probe_bw_probe_up_pacing_gain: None,
+        probe_bw_probe_down_pacing_gain: None,
+        probe_rtt_pacing_gain: None,
+        max_probe_up_queue_rounds: None,
+        loss_threshold: None,
+        use_bytes_delivered_for_inflight_hi: None,
+        decrease_startup_pacing_at_end_of_round: None,
+        bw_lo_reduction_strategy: None,
+        ignore_app_limited_for_no_bandwidth_growth: None,
+        initial_pacing_rate_bytes_per_second: None,
+        scale_pacing_rate_by_mss: None,
+        disable_probe_down_early_exit: None,
+        time_sent_set_to_now:None,
+        rtt_jump_detector: None,
+    };
+    config.set_custom_bbr_params(cust_bbr);
+
     if conn_args.disable_hystart {
         config.enable_hystart(false);
     }
@@ -177,6 +223,8 @@ fn main() {
     let mut continue_write = false;
 
     let local_addr = socket.local_addr().unwrap();
+    let local_addr = resolve_send_addr(local_addr);
+    trace!("local_addr: {local_addr}");
 
     loop {
         // Find the shorter timeout from all the active connections.
@@ -516,6 +564,57 @@ fn main() {
                 }
             }
 
+            // Drain any raw (non-HTTP) stream data sent by the client. quiche
+            // buffers received stream bytes internally, so if nothing ever
+            // calls stream_recv(), flow control will eventually stall the
+            // stream once the receive buffer fills up.
+            for stream_id in client.conn.readable() {
+                let mut stream_buf = [0; 65535];
+
+                while let Ok((read, fin)) =
+                    client.conn.stream_recv(stream_id, &mut stream_buf)
+                {
+                    trace!(
+                        "{} received {} bytes on stream {} (fin={})",
+                        client.conn.trace_id(),
+                        read,
+                        stream_id,
+                        fin
+                    );
+
+                    if fin {
+                        break;
+                    }
+                }
+            }
+
+            // Continuously send data back to the client on a
+            // server-initiated unidirectional stream. Stream ID 3 is the
+            // first server-initiated unidirectional stream in QUIC (client-
+            // initiated uni streams, like the one the client writes on,
+            // start at 2 and can only be read by the server).
+            if client.conn.is_established() {
+                let payload = b"Server data payload sent repeatedly\n";
+
+                match client.conn.stream_send(3, payload, false) {
+                    Ok(written) => trace!(
+                        "{} sent {} bytes on stream 3",
+                        client.conn.trace_id(),
+                        written
+                    ),
+
+                    Err(quiche::Error::Done) => {},
+
+                    Err(e) => {
+                        error!(
+                            "{} stream send failed: {:?}",
+                            client.conn.trace_id(),
+                            e
+                        );
+                    },
+                }
+            }
+
             handle_path_events(client);
 
             // See whether source Connection IDs have been retired.
@@ -622,10 +721,12 @@ fn main() {
         }
 
         // Garbage collect closed connections.
+        let mut count = 0;
         clients.retain(|_, ref mut c| {
             trace!("Collecting garbage");
 
             if c.conn.is_closed() {
+                count += 1;
                 info!(
                     "{} connection collected {:?} {:?}",
                     c.conn.trace_id(),
@@ -641,7 +742,66 @@ fn main() {
 
             !c.conn.is_closed()
         });
+        if count > 0{
+            break;
+        }
     }
+}
+
+/// If `listen_addr` is a wildcard address (0.0.0.0 or ::), quiche can't
+/// meaningfully use it as the connection's local address: it ends up in
+/// per-path state (RecvInfo::to, quiche::accept()'s `local` parameter, and
+/// ultimately outgoing SendInfo::from), where a real, non-wildcard address
+/// is expected. On a multi-homed host this also affects the source address
+/// send_to() ends up using for outgoing packets.
+///
+/// If the listen address isn't a wildcard, it's returned unchanged -- this
+/// is a no-op for the common case of binding to a specific interface. If it
+/// is a wildcard, we ask the OS which local address it would pick to reach
+/// the outside world: "connecting" a UDP socket doesn't send any packets,
+/// it's purely a routing-table lookup, and local_addr() afterwards reports
+/// the address the kernel would use. The original listen port is preserved.
+///
+/// Note this is resolved once at startup by asking the OS for its default
+/// route, so it picks whatever address the host would use to reach the
+/// public internet. That's usually right for a single-homed box, but on a
+/// host with multiple public IPs, behind certain NAT setups, or where the
+/// desired advertised address doesn't match the default route, it may not
+/// be the address you actually want advertised -- in that case this would
+/// need to become an explicit override (e.g. a --send-addr flag) rather
+/// than an auto-detected one.
+fn resolve_send_addr(listen_addr: net::SocketAddr) -> net::SocketAddr {
+    if !listen_addr.ip().is_unspecified() {
+        return listen_addr;
+    }
+
+    let (bind_addr, probe_target): (&str, &str) = match listen_addr {
+        net::SocketAddr::V4(_) => ("0.0.0.0:0", "8.8.8.8:80"),
+        net::SocketAddr::V6(_) => ("[::]:0", "[2001:4860:4860::8888]:80"),
+    };
+
+    let probe_socket = net::UdpSocket::bind(bind_addr)
+        .expect("failed to bind probe socket while resolving send address");
+
+    probe_socket
+        .connect(probe_target)
+        .expect(
+            "failed to resolve a local send address for a wildcard listen \
+             address; is there a default route configured?",
+        );
+
+    let mut send_addr = probe_socket
+        .local_addr()
+        .expect("failed to read local address from probe socket");
+
+    send_addr.set_port(listen_addr.port());
+
+    warn!(
+        "listen address {listen_addr} is a wildcard address; advertising \
+         {send_addr} as the send/local address for QUIC path state instead"
+    );
+
+    send_addr
 }
 
 /// Generate a stateless retry token.

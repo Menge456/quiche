@@ -56,6 +56,8 @@ pub struct CommonArgs {
     pub qpack_blocked_streams: Option<u64>,
     pub initial_rtt: Duration,
     pub initial_cwnd_packets: u64,
+    pub univ_cwnd_gain:Option<f32>,
+    pub run_timeout: Option<Duration>,
 }
 
 /// Creates a new `CommonArgs` structure using the provided [`Docopt`].
@@ -82,6 +84,8 @@ pub struct CommonArgs {
 /// --qpack-max-table-capacity BYTES  Max capacity of dynamic QPACK decoding.
 /// --qpack-blocked-streams STREAMS  Limit of blocked streams while decoding.
 /// --initial-cwnd-packets      Size of initial congestion window, in packets.
+/// -- univ_cwnd_gain           bbr-specific aggresiveness factor
+/// --run-timeout SECONDS       Shut down after the given number of seconds.
 ///
 /// [`Docopt`]: https://docs.rs/docopt/1.1.0/docopt/
 impl Args for CommonArgs {
@@ -197,6 +201,17 @@ impl Args for CommonArgs {
             .get_str("--initial-cwnd-packets")
             .parse::<u64>()
             .unwrap();
+        let univ_cwnd_gain = Some(args.get_str("--cwnd_gain").parse::<f32>().unwrap());
+
+        // Optional: if omitted, both sides run until terminated (e.g. by
+        // idle timeout or Ctrl-C) rather than shutting down on a clock.
+        let run_timeout = if !args.get_str("--run-timeout").is_empty() {
+            Some(Duration::from_secs(
+                args.get_str("--run-timeout").parse::<u64>().unwrap(),
+            ))
+        } else {
+            None
+        };
 
         CommonArgs {
             alpns,
@@ -222,6 +237,8 @@ impl Args for CommonArgs {
             qpack_blocked_streams,
             initial_rtt,
             initial_cwnd_packets,
+            univ_cwnd_gain,
+            run_timeout,
         }
     }
 }
@@ -252,6 +269,8 @@ impl Default for CommonArgs {
             qpack_blocked_streams: None,
             initial_rtt: Duration::from_millis(333),
             initial_cwnd_packets: 10,
+            univ_cwnd_gain: Some(2.0),
+            run_timeout: None,
         }
     }
 }
@@ -270,6 +289,7 @@ Options:
   --max-streams-bidi STREAMS  Number of allowed concurrent streams [default: 100].
   --max-streams-uni STREAMS   Number of allowed concurrent streams [default: 100].
   --idle-timeout TIMEOUT   Idle timeout in milliseconds [default: 30000].
+  --run-timeout SECONDS    Close the connection and exit after this many seconds. If omitted, runs until terminated.
   --wire-version VERSION   The version number to send to the server [default: babababa].
   --http-version VERSION   HTTP version to use [default: all].
   --early-data             Enable sending early data.
@@ -299,6 +319,7 @@ Options:
   --source-port PORT       Source port to use when connecting to the server [default: 0].
   --initial-rtt MILLIS     The initial RTT in milliseconds [default: 333].
   --initial-cwnd-packets PACKETS   The initial congestion window size in terms of packet count [default: 10].
+  --cwnd_gain GAIN         The cwnd_gain for the bbr algorithm.
   -h --help                Show this screen.
 ";
 
@@ -456,6 +477,7 @@ Options:
   --max-streams-bidi STREAMS  Number of allowed concurrent streams [default: 100].
   --max-streams-uni STREAMS   Number of allowed concurrent streams [default: 100].
   --idle-timeout TIMEOUT      Idle timeout in milliseconds [default: 30000].
+  --run-timeout SECONDS       Close each connection this many seconds after it starts. If omitted, connections run until terminated.
   --dump-packets PATH         Dump the incoming packets as files in the given directory.
   --early-data                Enable receiving early data.
   --no-retry                  Disable stateless retry.
@@ -475,6 +497,7 @@ Options:
   --disable-pacing            Disable pacing (linux only).
   --initial-rtt MILLIS     The initial RTT in milliseconds [default: 333].
   --initial-cwnd-packets PACKETS      The initial congestion window size in terms of packet count [default: 10].
+  --cwnd_gain GAIN                  The cwnd_gain value for testing
   -h --help                   Show this screen.
 ";
 
