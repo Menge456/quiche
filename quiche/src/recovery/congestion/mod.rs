@@ -118,6 +118,8 @@ pub struct Congestion {
     pub(crate) lost_count: usize,
 
     pub(crate) enable_cubic_idle_restart_fix: bool,
+
+    aggro_factor: Option<f32>,
 }
 
 impl Congestion {
@@ -159,6 +161,7 @@ impl Congestion {
 
             enable_cubic_idle_restart_fix: recovery_config
                 .enable_cubic_idle_restart_fix,
+            aggro_factor: recovery_config.aggro_factor
         };
 
         (cc.cc_ops.on_init)(&mut cc);

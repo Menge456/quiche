@@ -605,6 +605,9 @@ pub struct Config {
     track_unknown_transport_params: Option<usize>,
 
     initial_rtt: Duration,
+    aggro_factor: Option<f32>,
+
+    max_outstanding_sent_packets: Option<NonZeroUsize>,
 }
 
 // See https://quicwg.org/base-drafts/rfc9000.html#section-15
@@ -683,6 +686,11 @@ impl Config {
 
             track_unknown_transport_params: None,
             initial_rtt: DEFAULT_INITIAL_RTT,
+            aggro_factor: None,
+
+            max_outstanding_sent_packets: Some(
+                DEFAULT_MAX_OUTSTANDING_SENT_PACKETS,
+            ),
         })
     }
 
@@ -1095,6 +1103,14 @@ impl Config {
     pub fn set_custom_bbr_params(&mut self, custom_bbr_settings: BbrParams) {
         self.custom_bbr_params = Some(custom_bbr_settings);
     }
+
+    #[cfg(feature = "internal")]
+    #[doc(hidden)]
+    pub fn set_aggro_factor(&mut self, num: f32) {
+        self.aggro_factor = Some(num);
+    }
+
+
 
     /// Sets the congestion control algorithm used by string.
     ///

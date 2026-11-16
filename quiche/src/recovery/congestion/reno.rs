@@ -34,7 +34,7 @@ use std::time::Instant;
 use super::rtt::RttStats;
 use super::Acked;
 use super::Sent;
-
+use std::f64::consts::PI;
 use super::Congestion;
 use super::CongestionControlOps;
 use crate::recovery::LOSS_REDUCTION_FACTOR;
@@ -101,6 +101,10 @@ fn on_packet_acked(
 
         if r.bytes_acked_ca >= r.congestion_window {
             r.bytes_acked_ca -= r.congestion_window;
+            // match r.aggro_factor {
+            //     None => {r.congestion_window += r.max_datagram_size; ()}
+            //     Some(k) => {r.congestion_window += (k as usize) * r.max_datagram_size; ()}
+            // }
             r.congestion_window += r.max_datagram_size;
         }
     }
@@ -117,9 +121,10 @@ fn congestion_event(
     if !r.in_congestion_recovery(time_sent) {
         r.congestion_recovery_start_time = Some(now);
 
-        r.congestion_window =
-            (r.congestion_window as f64 * LOSS_REDUCTION_FACTOR) as usize;
-
+        match r.aggro_factor {
+                None => {r.congestion_window *= (r.congestion_window as f64 * LOSS_REDUCTION_FACTOR) as usize; ()}
+                Some(k) => { r.congestion_window = (r.congestion_window as f64 * LOSS_REDUCTION_FACTOR * (f32::MAX/k) as f64) as usize; ()}
+        }
         r.congestion_window = cmp::max(
             r.congestion_window,
             r.max_datagram_size * MINIMUM_WINDOW_PACKETS,
