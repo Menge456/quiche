@@ -607,7 +607,7 @@ pub struct Config {
     initial_rtt: Duration,
     aggro_factor: Option<f32>,
 
-    max_outstanding_sent_packets: Option<NonZeroUsize>,
+    //max_outstanding_sent_packets: Option<NonZeroUsize>,
 }
 
 // See https://quicwg.org/base-drafts/rfc9000.html#section-15
@@ -688,9 +688,9 @@ impl Config {
             initial_rtt: DEFAULT_INITIAL_RTT,
             aggro_factor: None,
 
-            max_outstanding_sent_packets: Some(
+           /*  max_outstanding_sent_packets: Some(
                 DEFAULT_MAX_OUTSTANDING_SENT_PACKETS,
-            ),
+            ),*/
         })
     }
 
